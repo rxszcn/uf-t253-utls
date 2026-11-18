@@ -275,13 +275,33 @@ func (uconn *UConn) SetSNI(sni string) {
 	}
 }
 
-// RemoveSNIExtension removes SNI from the list of extensions sent in ClientHello
-// It returns an error when used with HelloGolang ClientHelloID
+// RemoveSNIExtension removes SNI from the list of extensions sent in ClientHello.
+// It returns an error when used with HelloGolang ClientHelloID.
+//
+// The removal takes effect whether it is called before or after
+// BuildHandshakeState: if the ClientHello has already been built, the SNI
+// extension is dropped from the extension list immediately and the marshaled
+// ClientHello is regenerated, so the wire form no longer carries the
+// server_name extension nor the hostname.
 func (uconn *UConn) RemoveSNIExtension() error {
 	if uconn.ClientHelloID == HelloGolang {
 		return fmt.Errorf("cannot call RemoveSNIExtension on a UConn with a HelloGolang ClientHelloID")
 	}
 	uconn.omitSNIExtension = true
+	if uconn.clientHelloBuildStatus == BuildByUtls {
+		// The ClientHello has already been built and marshaled. The
+		// omitSNIExtension flag alone would never be consulted again (it is
+		// only honored on the first build), so apply the removal now:
+		// drop the extension and regenerate the marshaled ClientHello.
+		// HandshakeState.Hello.ServerName is intentionally left untouched,
+		// mirroring the pre-build removal path: it is never marshaled onto
+		// the wire (the ClientHello is marshaled from uconn.Extensions) and
+		// remains available for certificate verification and session state.
+		uconn.removeSNIExtension()
+		if err := uconn.MarshalClientHello(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

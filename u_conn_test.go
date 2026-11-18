@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -203,6 +204,127 @@ func TestUTLSRemoveSNIExtension(t *testing.T) {
 	}
 
 	runUTLSClientTestForVersion(t, test, "TLSv12-", "-tls1_2", hello, true)
+}
+
+// parseRawClientHelloExtensionTypes parses a marshaled ClientHello handshake
+// message (including the 4-byte handshake header) and returns the ordered
+// list of extension type IDs it carries on the wire.
+func parseRawClientHelloExtensionTypes(t *testing.T, raw []byte) []uint16 {
+	t.Helper()
+	if len(raw) < 4 {
+		t.Fatalf("raw ClientHello too short: %d bytes", len(raw))
+	}
+	if raw[0] != typeClientHello {
+		t.Fatalf("expected ClientHello handshake type, got %d", raw[0])
+	}
+	b := raw[4:]
+	read := func(n int) []byte {
+		if len(b) < n {
+			t.Fatalf("malformed ClientHello: need %d bytes, have %d", n, len(b))
+		}
+		out := b[:n]
+		b = b[n:]
+		return out
+	}
+	read(2 + 32)             // version + random
+	read(int(read(1)[0]))    // session id
+	csLen := read(2)         // cipher suites length
+	read(int(csLen[0])<<8 | int(csLen[1]))
+	read(int(read(1)[0])) // compression methods
+	extLen := read(2)     // extensions total length
+	exts := read(int(extLen[0])<<8 | int(extLen[1]))
+	var types []uint16
+	for len(exts) > 0 {
+		if len(exts) < 4 {
+			t.Fatalf("malformed extension block: %d bytes left", len(exts))
+		}
+		typ := uint16(exts[0])<<8 | uint16(exts[1])
+		l := int(exts[2])<<8 | int(exts[3])
+		if len(exts) < 4+l {
+			t.Fatalf("malformed extension %d: length %d, %d bytes left", typ, l, len(exts)-4)
+		}
+		types = append(types, typ)
+		exts = exts[4+l:]
+	}
+	return types
+}
+
+// TestUTLSRemoveSNIExtensionWire asserts the wire form of the ClientHello
+// after RemoveSNIExtension, both when called after BuildHandshakeState and
+// before it, against a control group that keeps SNI.
+func TestUTLSRemoveSNIExtensionWire(t *testing.T) {
+	const serverName = "foobar.com" // set by getUTLSTestConfig
+
+	newUConn := func() *UConn {
+		return UClient(&net.TCPConn{}, getUTLSTestConfig(), HelloChrome_70)
+	}
+
+	assertNoSNIOnWire := func(t *testing.T, uconn *UConn, controlExts []uint16) {
+		t.Helper()
+		raw := uconn.HandshakeState.Hello.Raw
+		if len(raw) == 0 {
+			t.Fatal("marshaled ClientHello is empty")
+		}
+		if bytes.Contains(raw, []byte(serverName)) {
+			t.Errorf("wire ClientHello still contains hostname %q", serverName)
+		}
+		for _, ext := range uconn.Extensions {
+			if _, ok := ext.(*SNIExtension); ok {
+				t.Error("SNIExtension still present in uconn.Extensions")
+			}
+		}
+		got := parseRawClientHelloExtensionTypes(t, raw)
+		// The remaining extensions must be exactly the control group's
+		// extensions minus server_name, in the original order.
+		want := make([]uint16, 0, len(controlExts))
+		for _, typ := range controlExts {
+			if typ != extensionServerName {
+				want = append(want, typ)
+			}
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("extension types after SNI removal = %v, want %v", got, want)
+		}
+	}
+
+	// Control group: no SNI removal, wire form must carry the SNI extension
+	// and the full hostname.
+	control := newUConn()
+	if err := control.BuildHandshakeState(); err != nil {
+		t.Fatalf("control BuildHandshakeState failed: %v", err)
+	}
+	controlRaw := control.HandshakeState.Hello.Raw
+	if !bytes.Contains(controlRaw, []byte(serverName)) {
+		t.Fatalf("control wire ClientHello does not contain hostname %q", serverName)
+	}
+	controlExts := parseRawClientHelloExtensionTypes(t, controlRaw)
+	if !slices.Contains(controlExts, extensionServerName) {
+		t.Fatalf("control wire ClientHello does not carry the SNI extension: %v", controlExts)
+	}
+
+	// Removal after BuildHandshakeState must take real effect on the wire.
+	t.Run("AfterBuild", func(t *testing.T) {
+		uconn := newUConn()
+		if err := uconn.BuildHandshakeState(); err != nil {
+			t.Fatalf("BuildHandshakeState failed: %v", err)
+		}
+		if err := uconn.RemoveSNIExtension(); err != nil {
+			t.Fatalf("RemoveSNIExtension failed: %v", err)
+		}
+		assertNoSNIOnWire(t, uconn, controlExts)
+	})
+
+	// Removal before BuildHandshakeState keeps its existing behavior.
+	t.Run("BeforeBuild", func(t *testing.T) {
+		uconn := newUConn()
+		if err := uconn.RemoveSNIExtension(); err != nil {
+			t.Fatalf("RemoveSNIExtension failed: %v", err)
+		}
+		if err := uconn.BuildHandshakeState(); err != nil {
+			t.Fatalf("BuildHandshakeState failed: %v", err)
+		}
+		assertNoSNIOnWire(t, uconn, controlExts)
+	})
 }
 
 func TestUTLSServerNameIP(t *testing.T) {
